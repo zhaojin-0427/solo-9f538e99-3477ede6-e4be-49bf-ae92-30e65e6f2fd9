@@ -56,6 +56,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/waybills` | 列出全部运单 |
 | POST | `/api/waybills/{waybill_id}/scans/batch` | 批量提交交接 / 更正 / 撤回 |
 | GET | `/api/waybills/{waybill_id}/chain` | 查询可信前缀、断链原因、当前保管方 |
+| POST | `/api/bills` | 对已结束的 UTC 日生成日结账单（同日重试返回原单） |
+| GET | `/api/bills` | 按出账顺序列出全部账单摘要 |
+| GET | `/api/bills/{service_date}` | 按服务日查询已出具的账单 |
 | GET | `/docs` | Swagger UI，可直接录入与查询 |
 
 ### 交接批次示例
@@ -97,6 +100,46 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 `break_reason` 取值：`NONE` / `GAP`（保管方不承接）/ `SIMULTANEOUS`（同时刻多笔，顺序不可判定）。
 `current_custodian` 只沿已证实交接推进，因此断链后仍可信地停留在最后一个已证实接收方。
 
+## 日结账单
+
+晚到的交接扫描可能改变已结算日的保管时长，账单因此按“只增不改、差额后补”处理：
+
+- **出账范围**：一次只结算一个已结束的 UTC 日。首日可任选，此后必须逐日续开，跳日返回 `409`。
+  对同一天重复请求返回最初冻结的账单原单，内容逐字节不变。
+- **计费口径**：只计相邻两笔**可信**交接之间的时长（即链查询中的 `verified_prefix`），
+  归前一笔交接的 `receiver`；跨 UTC 午夜时按日切开分别计入两天。断链后的扫描不计时。
+- **账单内容**：当日各运单、各保管方的 `custody` 时长；以及 `adjustments`——此前已出账日
+  重新汇总后的未入账净差额，逐条注明 `origin_service_date`、`waybill_id`、`custodian`
+  和带正负号的 `duration_seconds`。
+- **不重复补记**：每次出账把各已出账日按 `(服务日, 运单, 保管方)` 的累计已入账时长更新为
+  最新真相；后续账单只补尚未入账的差额，已出具的账单永不改动。
+- **并发**：汇总在只读快照中完成，仅在短暂写入阶段加锁并用变更序号做乐观校验；汇总期间
+  扫描照常提交，若快照后被扫描改变则本次出账返回 `409` 供重试。
+- **失败原子性**：任何冲突或失败都不会留下账单，待入账差额留到下次重试；账单存于 SQLite，
+  进程重启后仍可查询。
+
+### 出账示例
+
+```json
+POST /api/bills        {"service_date": "2026-01-02"}
+```
+
+```json
+{
+  "service_date": "2026-01-02",
+  "sequence": 2,
+  "issued_at": "2026-11-19T20:31:27.305407Z",
+  "custody": [],
+  "adjustments": [
+    {"origin_service_date": "2026-01-01", "waybill_id": "AWB-001",
+     "custodian": "HKG-WAREHOUSE", "duration_seconds": -7200}
+  ],
+  "custody_total_seconds": 0,
+  "adjustment_total_seconds": -7200,
+  "total_seconds": -7200
+}
+```
+
 ## 测试
 
 ```bash
@@ -104,6 +147,7 @@ pip install pytest httpx
 pytest -q
 ```
 
-共 27 个用例，覆盖：乱序补传归位、时区归一化、最高修订裁决、同修订异文整批回滚、
+共 42 个用例，覆盖：乱序补传归位、时区归一化、最高修订裁决、同修订异文整批回滚、
 撤回与补报修复断链、GAP/SIMULTANEOUS 检测、输入校验、真实线程下的写串行化、
-交错读不到混合修订，以及进程重启持久化。
+交错读不到混合修订，进程重启持久化，以及日结账单的跨午夜切分、同日重试、
+差额调整、不重复补记、失败不留单、出账期间扫描并发提交。

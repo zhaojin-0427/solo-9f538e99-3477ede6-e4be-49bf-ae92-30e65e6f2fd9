@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import ValidationError
 
-from . import config, services
+from . import billing, config, services
 from .database import connect, init_db
 from .schemas import BatchResponse, BatchSubmit, ChainResponse, WaybillCreate
 
@@ -75,6 +76,63 @@ def list_waybills(conn: sqlite3.Connection = Depends(get_conn)) -> dict:
         "SELECT id, origin_party, created_at FROM waybills ORDER BY id"
     ).fetchall()
     return {"waybills": [dict(r) for r in rows]}
+
+
+# --------------------------------------------------------------------------- #
+# Daily settlement bills
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/api/bills",
+    response_model=billing.BillResponse,
+    tags=["bills"],
+    responses={409: {"description": "日期未结束 / 未按日续开 / 并发冲突，可重试"}},
+)
+def issue_bill(
+    body: billing.BillIssueRequest, conn: sqlite3.Connection = Depends(get_conn)
+) -> billing.BillResponse:
+    """对已结束的 UTC 日生成日结账单。
+
+    * 首日任意；此后必须逐日续开，跳日返回 409。
+    * 同日重复请求返回最初冻结的账单原单（内容不变）。
+    * 出账时先结算此前已出账日的未入账净差额，作为带正负号的调整项。
+    * 任何冲突或失败都不会留下账单，待入账差额留待重试。
+    """
+    return billing.issue_bill(conn, body.service_date)
+
+
+@app.post(
+    "/api/bills/{service_date}",
+    response_model=billing.BillResponse,
+    tags=["bills"],
+    responses={409: {"description": "日期未结束 / 未按日续开 / 并发冲突，可重试"}},
+)
+def issue_bill_for_date(
+    service_date: date, conn: sqlite3.Connection = Depends(get_conn)
+) -> billing.BillResponse:
+    """按路径中的服务日生成日结账单（等价于 POST /api/bills）。"""
+    return billing.issue_bill(conn, service_date)
+
+
+@app.get(
+    "/api/bills",
+    response_model=list[billing.BillSummary],
+    tags=["bills"],
+)
+def list_bills(conn: sqlite3.Connection = Depends(get_conn)) -> list[billing.BillSummary]:
+    """按出账顺序列出全部日结账单摘要。"""
+    return billing.list_bills(conn)
+
+
+@app.get(
+    "/api/bills/{service_date}",
+    response_model=billing.BillResponse,
+    tags=["bills"],
+)
+def get_bill(
+    service_date: date, conn: sqlite3.Connection = Depends(get_conn)
+) -> billing.BillResponse:
+    """按服务日查询已出具的日结账单（进程重启后仍可查）。"""
+    return billing.get_bill(conn, service_date)
 
 
 @app.post(

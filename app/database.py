@@ -46,6 +46,53 @@ CREATE TABLE IF NOT EXISTS scans (
 );
 
 CREATE INDEX IF NOT EXISTS idx_scans_waybill ON scans (waybill_id, scan_id, revision);
+
+-- Daily settlement bills.  A bill is immutable once written: one row per
+-- ended UTC service day, issued strictly in consecutive-day order.
+CREATE TABLE IF NOT EXISTS bills (
+    service_date    TEXT PRIMARY KEY,       -- YYYY-MM-DD (UTC service day)
+    sequence        INTEGER NOT NULL UNIQUE,
+    issued_at       TEXT NOT NULL
+);
+
+-- Frozen bill content.  CUSTODY lines are the day's own per-waybill /
+-- per-custodian durations; ADJUSTMENT lines carry a signed delta for a
+-- service day billed earlier.
+CREATE TABLE IF NOT EXISTS bill_lines (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    service_date        TEXT NOT NULL REFERENCES bills(service_date),
+    kind                TEXT NOT NULL CHECK (kind IN ('CUSTODY', 'ADJUSTMENT')),
+    waybill_id          TEXT NOT NULL,
+    custodian           TEXT NOT NULL,
+    origin_service_date TEXT,
+    duration_seconds    INTEGER NOT NULL,
+    CHECK (
+        (kind = 'CUSTODY'    AND origin_service_date IS NULL) OR
+        (kind = 'ADJUSTMENT' AND origin_service_date IS NOT NULL)
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_bill_lines_bill
+    ON bill_lines (service_date, id);
+
+-- Cumulative amount already billed per (service day, waybill, custodian).
+-- Adjustments move these values to the recomputed truth so that a later
+-- bill never back-bills the same delta twice.
+CREATE TABLE IF NOT EXISTS billed_totals (
+    service_date    TEXT NOT NULL,
+    waybill_id      TEXT NOT NULL,
+    custodian       TEXT NOT NULL,
+    seconds         INTEGER NOT NULL,
+    PRIMARY KEY (service_date, waybill_id, custodian)
+);
+
+-- Small key/value store.  ``change_seq`` is bumped by every committed scan
+-- batch and every issued bill; billing uses it as an optimistic token so a
+-- long read-only aggregation never blocks incoming scans.
+CREATE TABLE IF NOT EXISTS meta (
+    key     TEXT PRIMARY KEY,
+    value   TEXT NOT NULL
+);
 """
 
 
@@ -90,3 +137,21 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
         raise
     else:
         conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Optimistic change token
+# --------------------------------------------------------------------------- #
+def change_seq(conn: sqlite3.Connection) -> int:
+    """Current global change sequence (0 if never bumped)."""
+    row = conn.execute("SELECT value FROM meta WHERE key = 'change_seq'").fetchone()
+    return int(row["value"]) if row is not None else 0
+
+
+def bump_change_seq(conn: sqlite3.Connection) -> int:
+    """Increment the change sequence inside the caller's transaction."""
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('change_seq', '1') "
+        "ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1"
+    )
+    return change_seq(conn)

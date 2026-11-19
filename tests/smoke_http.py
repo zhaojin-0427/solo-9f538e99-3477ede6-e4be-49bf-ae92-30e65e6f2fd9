@@ -87,4 +87,35 @@ st, body = call("POST", "/api/waybills/AWB-SMOKE/scans/batch", {"scans": [
 ]})
 check("naive timestamp -> 422", st == 422)
 
+# daily settlement bills
+st, body = call("POST", "/api/waybills", {"waybill_id": "AWB-BILL", "origin_party": "ORIG"})
+check("create bill waybill", st == 201, body)
+call("POST", "/api/waybills/AWB-BILL/scans/batch", {"scans": [
+    {"scan_id": "B1", "revision": 1, "ts_utc": "2026-01-01T08:00:00Z", "giver": "ORIG", "receiver": "A"},
+    {"scan_id": "B2", "revision": 1, "ts_utc": "2026-01-01T20:00:00Z", "giver": "A", "receiver": "B"},
+]})
+st, body = call("POST", "/api/bills", {"service_date": "2026-01-01"})
+check("issue bill", st == 200, body)
+check("custody belongs to earlier receiver", body["custody"][0]["custodian"] == "A")
+check("custody duration counted", body["custody"][0]["duration_seconds"] == 12 * 3600)
+st, retry = call("POST", "/api/bills", {"service_date": "2026-01-01"})
+check("same-day retry returns original", st == 200 and retry == body)
+st, skipped = call("POST", "/api/bills", {"service_date": "2026-01-03"})
+check("skipped day -> 409", st == 409, skipped)
+st, missing = call("GET", "/api/bills/2026-01-03")
+check("failed issue leaves no bill", st == 404, missing)
+call("POST", "/api/waybills/AWB-BILL/scans/batch", {"scans": [
+    {"scan_id": "B2", "revision": 2, "ts_utc": "2026-01-01T18:00:00Z", "giver": "A", "receiver": "B"},
+]})
+st, day2 = call("POST", "/api/bills", {"service_date": "2026-01-02"})
+check("next day issued", st == 200, day2)
+adj = [a for a in day2["adjustments"] if a["custodian"] == "A"]
+check("late scan becomes signed adjustment",
+      len(adj) == 1 and adj[0]["duration_seconds"] == -2 * 3600
+      and adj[0]["origin_service_date"] == "2026-01-01", day2["adjustments"])
+st, orig = call("GET", "/api/bills/2026-01-01")
+check("original bill frozen", st == 200 and orig == body)
+st, listing = call("GET", "/api/bills")
+check("bill list", st == 200 and len(listing) == 2)
+
 print("ALL SMOKE CHECKS PASSED")

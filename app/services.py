@@ -67,7 +67,7 @@ def get_waybill(conn: sqlite3.Connection, waybill_id: str) -> sqlite3.Row:
 def apply_batch(
     conn: sqlite3.Connection, waybill_id: str, batch: BatchSubmit
 ) -> BatchResponse:
-    from .database import transaction
+    from .database import bump_change_seq, transaction
 
     get_waybill(conn, waybill_id)  # 404-style check before opening the txn
 
@@ -84,6 +84,9 @@ def apply_batch(
             if entry.event_type == "WITHDRAWAL":
                 withdrawn.append(entry.scan_id)
             applied += 1
+        if applied:
+            # Signals settlement that the recomputable truth may have moved.
+            bump_change_seq(conn)
 
     # Recompute against the freshly committed snapshot.  Scan writes and the
     # returned query result therefore become visible together.
